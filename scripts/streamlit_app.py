@@ -1,80 +1,119 @@
 import streamlit as st
+import sys
+import os
+
+# Add script directory to Python path
+sys.path.append(os.path.dirname(__file__))
+
+# Import the recommendation engine
 from spark_recommendation import RecommendationEngine
-import logging
-import pandas as pd
 
-# Configuration
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("StreamlitApp")
-
-# Initialiser le moteur de recommandation
-@st.cache_resource
-def load_recommendation_engine():
-    return RecommendationEngine("processed_data/cleaned_reviews.csv")
-
-def display_recommendations(recommendations):
-    if not recommendations:
-        st.warning("Aucune recommandation trouvée.")
-        return
+def load_recommendation_engine(csv_path):
+    """
+    Load recommendation engine with error handling
     
-    # Convert to DataFrame with proper null handling
-    rec_list = []
-    for rec in recommendations:
-        price = rec['price']
-        rec_list.append({
-            'Produit': rec['title'],
-            'Prix': f"${price:.2f}" if price is not None else "N/A",
-            'ID Produit': rec['productId']
-        })
+    Args:
+        csv_path (str): Path to reviews CSV
     
-    rec_df = pd.DataFrame(rec_list)
-    st.table(rec_df)
+    Returns:
+        RecommendationEngine or None
+    """
+    try:
+        return RecommendationEngine(csv_path)
+    except Exception as e:
+        st.error(f"Failed to load recommendation engine: {e}")
+        return None
 
 def main():
-    st.set_page_config(page_title="Système de Recommandation E-commerce", layout="wide")
-    st.title("🎯 Système de Recommandation E-commerce")
+    # Page configuration
+    st.set_page_config(
+        page_title="Product Recommendation System", 
+        page_icon="🛍️", 
+        layout="wide"
+    )
     
-    engine = load_recommendation_engine()
+    # Title and description
+    st.title("🎯 Product Recommendation System")
+    st.markdown("""
+    ### Discover Personalized Product Recommendations
     
-    st.sidebar.header("Options")
-    option = st.sidebar.radio(
-        "Type de recommandation",
-        ["Pour un utilisateur", "Pour un produit"],
+    Choose between:
+    - User-based Recommendations
+    - Similar Product Recommendations
+    """)
+    
+    # Load recommendation engine
+    csv_path = "data/reviews.csv"  # Adjust path as needed
+    engine = load_recommendation_engine(csv_path)
+    
+    if engine is None:
+        st.stop()
+    
+    # Sidebar configuration
+    st.sidebar.header("Recommendation Options")
+    rec_type = st.sidebar.radio(
+        "Select Recommendation Type",
+        ["User Recommendations", "Similar Products"],
         index=0
     )
     
+    # Example IDs
     st.sidebar.markdown("---")
     st.sidebar.info(
-        "Exemples d'IDs à tester:\n"
-        "- Utilisateur: A31KXTOQNTWUVM\n"
-        "- Produit: B000EENAE0"
+        "Example IDs:\n"
+        "- User ID: A31KXTOQNTWUVM\n"
+        "- Product ID: B000EENAE0"
     )
     
-    if option == "Pour un utilisateur":
-        st.header("🔍 Recommandations personnalisées")
-        user_id = st.text_input("Entrez l'ID de l'utilisateur:", "A31KXTOQNTWUVM")
+    # User Recommendations Section
+    if rec_type == "User Recommendations":
+        st.header("👤 Personalized Recommendations")
         
-        if st.button("Générer des recommandations", key="user_rec"):
-            with st.spinner("Recherche des recommandations..."):
+        user_id = st.text_input(
+            "Enter User ID", 
+            value="A31KXTOQNTWUVM",
+            help="Input a specific user ID"
+        )
+        
+        if st.button("Get Recommendations", key="user_rec"):
+            with st.spinner("Generating recommendations..."):
                 try:
                     recommendations = engine.recommend_for_user(user_id)
-                    st.subheader("Résultats")
-                    display_recommendations(recommendations)
-                except Exception as e:
-                    st.error(f"Une erreur est survenue: {str(e)}")
-    
-    else:
-        st.header("🛍️ Produits similaires")
-        product_id = st.text_input("Entrez l'ID du produit:", "B000EENAE0")
-        
-        if st.button("Trouver des produits similaires", key="product_rec"):
-            with st.spinner("Recherche de produits similaires..."):
-                try:
-                    similar_products = engine.recommend_for_product(product_id)
-                    st.subheader("Résultats")
-                    display_recommendations(similar_products)
-                except Exception as e:
-                    st.error(f"Une erreur est survenue: {str(e)}")
                     
+                    if len(recommendations) > 0:
+                        st.subheader(f"Recommendations for User {user_id}")
+                        st.dataframe(recommendations[['title', 'price', 'recommendation_score']])
+                    else:
+                        st.warning("No recommendations found.")
+                except Exception as e:
+                    st.error(f"Error generating recommendations: {e}")
+    
+    # Similar Products Section
+    else:
+        st.header("🔍 Find Similar Products")
+        
+        product_id = st.text_input(
+            "Enter Product ID", 
+            value="B000EENAE0",
+            help="Input a product ID to find similar products"
+        )
+        
+        if st.button("Find Similar Products", key="product_rec"):
+            with st.spinner("Searching for similar products..."):
+                try:
+                    similar_products = engine.recommend_similar_products(product_id)
+                    
+                    if len(similar_products) > 0:
+                        st.subheader(f"Products Similar to {product_id}")
+                        st.dataframe(similar_products[['title', 'price', 'similarity_score']])
+                    else:
+                        st.warning("No similar products found.")
+                except Exception as e:
+                    st.error(f"Error finding similar products: {e}")
+
+    # Footer
+    st.markdown("---")
+    st.markdown("*Powered by Machine Learning Recommendation Engine*")
+
 if __name__ == "__main__":
     main()
