@@ -113,7 +113,7 @@ def main():
 
     # Footer
     st.markdown("---")
-    st.markdown("*Powered by Machine Learning Recommendation Engine*")
+    st.markdown("*Mady By Ziad Boukhalkhal - Khalil Hamdaoui*")
 
 if __name__ == "__main__":
     main()

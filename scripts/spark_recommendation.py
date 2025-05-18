@@ -2,8 +2,18 @@ import pandas as pd
 import numpy as np
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
+from implicit.als import AlternatingLeastSquares
+from scipy.sparse import csr_matrix
 import logging
 import re
+import os
+import warnings
+
+# Suppress numpy warnings about divide by zero in correlation calculations
+warnings.filterwarnings("ignore", category=RuntimeWarning)
+
+# Configure OpenBLAS to use just 1 thread to avoid performance issues
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
 
 # Configure logging
 logging.basicConfig(
@@ -26,6 +36,9 @@ class RecommendationEngine:
             
             # Clean and prepare data
             self._prepare_data()
+            
+            # Initialize ALS model
+            self._prepare_als_model()
             
             logger.info(f"Loaded {len(self.df)} reviews")
         except Exception as e:
@@ -119,10 +132,66 @@ class RecommendationEngine:
         }).reset_index()
         
         self.product_stats.columns = ['productId', 'title', 'price', 'review_count', 'avg_score']
+        
+        # Create user and item mapping for ALS
+        self.user_ids = self.df['userId'].unique()
+        self.product_ids = self.df['productId'].unique()
+        
+        # Create mappings for ALS
+        self.user_to_idx = {user: idx for idx, user in enumerate(self.user_ids)}
+        self.idx_to_user = {idx: user for user, idx in self.user_to_idx.items()}
+        
+        self.product_to_idx = {product: idx for idx, product in enumerate(self.product_ids)}
+        self.idx_to_product = {idx: product for product, idx in self.product_to_idx.items()}
+
+    def _prepare_als_model(self):
+        """
+        Prepare and train ALS model for collaborative filtering
+        """
+        try:
+            # Create user-item interaction matrix
+            # Map user and product IDs to indices
+            user_indices = [self.user_to_idx[user] for user in self.df['userId']]
+            product_indices = [self.product_to_idx[product] for product in self.df['productId']]
+            
+            # Normalize ratings to confidence scores (1-5 scale to confidence)
+            # We treat higher ratings as stronger confidence indicators
+            confidence_scores = self.df['score'].values / 5.0
+            
+            # Create sparse matrix: rows are users, columns are items, values are ratings
+            shape = (len(self.user_ids), len(self.product_ids))
+            interaction_matrix = csr_matrix(
+                (confidence_scores, (user_indices, product_indices)), 
+                shape=shape
+            )
+            
+            # Initialize and train ALS model
+            self.als_model = AlternatingLeastSquares(
+                factors=50,  # Number of latent factors
+                regularization=0.01,
+                iterations=15,
+                use_native=True,  # Use native extension for speed
+                use_cg=True,      # Use conjugate gradient for training
+                calculate_training_loss=True,
+                random_state=42    # For reproducibility
+            )
+            
+            # Fit the model
+            self.als_model.fit(interaction_matrix)
+            
+            # Store the interaction matrix for later use
+            self.interaction_matrix = interaction_matrix
+            
+            logger.info("ALS model trained successfully")
+        
+        except Exception as e:
+            logger.error(f"Error training ALS model: {e}")
+            # If ALS fails, set model to None
+            self.als_model = None
 
     def recommend_for_user(self, user_id, n_recommendations=5):
         """
-        Generate recommendations for a specific user
+        Generate recommendations for a specific user using ALS
         
         Args:
             user_id (str): User ID
@@ -141,51 +210,135 @@ class RecommendationEngine:
                 self.df[self.df['userId'] == user_id]['productId']
             )
             
-            # Get user's reviews
-            user_ratings = self.df[self.df['userId'] == user_id]
-            
-            # If user not found, return top-rated products
-            if len(user_ratings) == 0:
+            # Check if user exists in our mapping
+            if user_id not in self.user_to_idx:
                 logger.warning(f"User {user_id} not found. Returning top products.")
                 return self._get_top_products(n_recommendations)
             
-            # Find similar users based on rating patterns
-            similar_users_ratings = self.df[
-                ~self.df['productId'].isin(user_reviewed_products)
-            ]
+            # Get user index
+            user_idx = self.user_to_idx[user_id]
             
-            # Score recommendations
-            def compute_similarity(group):
-                """
-                Compute recommendation score for a product
-                """
+            # Get ALS recommendations if model is available
+            if self.als_model is not None:
                 try:
-                    # Compare ratings distribution
-                    return np.corrcoef(
-                        group['score'], 
-                        user_ratings['score']
-                    )[0,1]
-                except Exception:
-                    return 0
-            
-            recommendation_scores = similar_users_ratings.groupby('productId').apply(compute_similarity)
-            
-            # Get top recommendations
-            top_recommendations = recommendation_scores.nlargest(n_recommendations)
-            
-            # Merge with product stats
-            recommended_products = self.product_stats[
-                self.product_stats['productId'].isin(top_recommendations.index)
-            ].copy()
-            
-            # Add recommendation score
-            recommended_products['recommendation_score'] = top_recommendations.values
-            
-            return recommended_products.sort_values('recommendation_score', ascending=False)
+                    # Get recommendations from ALS model
+                    rec_product_indices, rec_scores = self.als_model.recommend(
+                        user_idx, 
+                        self.interaction_matrix, 
+                        N=n_recommendations + len(user_reviewed_products),  # Get extra to account for filtering
+                        filter_already_liked_items=True
+                    )
+                    
+                    # Convert back to product IDs
+                    rec_product_ids = [self.idx_to_product[idx] for idx in rec_product_indices]
+                    
+                    # Filter out products user has already reviewed (extra safety check)
+                    filtered_products = []
+                    filtered_scores = []
+                    for product_id, score in zip(rec_product_ids, rec_scores):
+                        if product_id not in user_reviewed_products:
+                            filtered_products.append(product_id)
+                            filtered_scores.append(score)
+                    
+                    # If we don't have enough recommendations after filtering
+                    if len(filtered_products) < n_recommendations:
+                        additional_products = self._get_top_products(
+                            n_recommendations - len(filtered_products)
+                        )
+                        remaining_product_ids = list(additional_products['productId'])
+                        filtered_products.extend(remaining_product_ids)
+                        # Add placeholder scores
+                        filtered_scores.extend([0.5] * len(remaining_product_ids))
+                    
+                    # Get product information for recommended products
+                    recommended_products = self.product_stats[
+                        self.product_stats['productId'].isin(filtered_products[:n_recommendations])
+                    ].copy()
+                    
+                    # Add recommendation score
+                    recommendation_scores = {
+                        pid: score for pid, score in zip(filtered_products, filtered_scores)
+                    }
+                    recommended_products['recommendation_score'] = recommended_products['productId'].map(
+                        recommendation_scores
+                    )
+                    
+                    return recommended_products.sort_values('recommendation_score', ascending=False)
+                
+                except Exception as e:
+                    logger.error(f"ALS recommendation error for user {user_id}: {e}")
+                    # Fallback to previous method
+                    return self._collaborative_filtering_recommendations(user_id, n_recommendations)
+            else:
+                # Fallback to previous method if ALS model failed
+                return self._collaborative_filtering_recommendations(user_id, n_recommendations)
         
         except Exception as e:
             logger.error(f"Recommendation error for user {user_id}: {e}")
+            # Fallback to collaborative filtering or top products
+            try:
+                return self._collaborative_filtering_recommendations(user_id, n_recommendations)
+            except Exception as e2:
+                logger.error(f"Fallback recommendation error: {e2}")
+                return self._get_top_products(n_recommendations)
+
+    def _collaborative_filtering_recommendations(self, user_id, n_recommendations=5):
+        """
+        Fallback recommendation method using simple collaborative filtering
+        
+        Args:
+            user_id (str): User ID
+            n_recommendations (int): Number of recommendations
+        
+        Returns:
+            DataFrame: Recommended products
+        """
+        # Get products user has already reviewed
+        user_reviewed_products = set(
+            self.df[self.df['userId'] == user_id]['productId']
+        )
+        
+        # Get user's reviews
+        user_ratings = self.df[self.df['userId'] == user_id]
+        
+        # If user not found, return top-rated products
+        if len(user_ratings) == 0:
+            logger.warning(f"User {user_id} not found. Returning top products.")
             return self._get_top_products(n_recommendations)
+        
+        # Find similar users based on rating patterns
+        similar_users_ratings = self.df[
+            ~self.df['productId'].isin(user_reviewed_products)
+        ]
+        
+        # Score recommendations
+        def compute_similarity(group):
+            """
+            Compute recommendation score for a product
+            """
+            try:
+                # Compare ratings distribution
+                return np.corrcoef(
+                    group['score'], 
+                    user_ratings['score']
+                )[0,1]
+            except Exception:
+                return 0
+        
+        recommendation_scores = similar_users_ratings.groupby('productId').apply(compute_similarity)
+        
+        # Get top recommendations
+        top_recommendations = recommendation_scores.nlargest(n_recommendations)
+        
+        # Merge with product stats
+        recommended_products = self.product_stats[
+            self.product_stats['productId'].isin(top_recommendations.index)
+        ].copy()
+        
+        # Add recommendation score
+        recommended_products['recommendation_score'] = top_recommendations.values
+        
+        return recommended_products.sort_values('recommendation_score', ascending=False)
 
     def recommend_similar_products(self, product_id, n_recommendations=5):
         """
@@ -265,7 +418,7 @@ def main():
         engine = RecommendationEngine(csv_path)
         
         # Example user recommendations
-        print("\n=== User Recommendations ===")
+        print("\n=== User Recommendations (ALS) ===")
         user_id = "A31KXTOQNTWUVM"
         user_recs = engine.recommend_for_user(user_id)
         print(user_recs[['title', 'price', 'recommendation_score']])
