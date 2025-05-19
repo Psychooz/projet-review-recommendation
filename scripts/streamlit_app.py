@@ -1,6 +1,9 @@
 import streamlit as st
 import sys
 import os
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
 
 # Add script directory to Python path
 sys.path.append(os.path.dirname(__file__))
@@ -24,6 +27,67 @@ def load_recommendation_engine(csv_path):
         st.error(f"Failed to load recommendation engine: {e}")
         return None
 
+def show_statistics(engine):
+    """Display various statistics about the data"""
+    st.header("📊 Data Statistics and Insights")
+    
+    # Basic statistics
+    st.subheader("Basic Dataset Information")
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Total Reviews", len(engine.df))
+    col2.metric("Unique Users", len(engine.user_ids))
+    col3.metric("Unique Products", len(engine.product_ids))
+    
+    # Create a copy of the dataframe for visualization
+    viz_df = engine.df.copy()
+    
+    # Convert score to numeric if it's not already
+    viz_df['score'] = pd.to_numeric(viz_df['score'], errors='coerce')
+    
+    # Rating distribution
+    st.subheader("Rating Distribution")
+    fig, ax = plt.subplots()
+    sns.countplot(x='score', data=viz_df.dropna(subset=['score']), ax=ax)
+    ax.set_title("Distribution of Product Ratings")
+    st.pyplot(fig)
+    
+    # Price distribution
+    st.subheader("Price Distribution")
+    fig, ax = plt.subplots()
+    sns.histplot(viz_df['price'].dropna(), bins=30, kde=True, ax=ax)
+    ax.set_title("Distribution of Product Prices")
+    ax.set_xlabel("Price")
+    st.pyplot(fig)
+    
+    # Top rated products
+    st.subheader("Top Rated Products (with most reviews)")
+    top_products = engine.product_stats.sort_values(
+        ['avg_score', 'review_count'], 
+        ascending=[False, False]
+    ).head(10)
+    st.dataframe(top_products[['title', 'price', 'avg_score', 'review_count']])
+    
+    # Most active users
+    st.subheader("Most Active Users")
+    user_activity = engine.df['userId'].value_counts().reset_index()
+    user_activity.columns = ['userId', 'review_count']
+    st.dataframe(user_activity.head(10))
+    
+    # Price vs. Rating analysis
+    st.subheader("Price vs. Rating Analysis")
+    fig, ax = plt.subplots()
+    sns.scatterplot(
+        x='price', 
+        y='avg_score', 
+        size='review_count',
+        sizes=(20, 200),
+        alpha=0.6,
+        data=engine.product_stats,
+        ax=ax
+    )
+    ax.set_title("Price vs. Average Rating")
+    st.pyplot(fig)
+
 def main():
     # Page configuration
     st.set_page_config(
@@ -40,6 +104,7 @@ def main():
     Choose between:
     - User-based Recommendations
     - Similar Product Recommendations
+    - Data Statistics
     """)
     
     # Load recommendation engine
@@ -53,7 +118,7 @@ def main():
     st.sidebar.header("Recommendation Options")
     rec_type = st.sidebar.radio(
         "Select Recommendation Type",
-        ["User Recommendations", "Similar Products"],
+        ["User Recommendations", "Similar Products", "Data Statistics"],
         index=0
     )
     
@@ -89,7 +154,7 @@ def main():
                     st.error(f"Error generating recommendations: {e}")
     
     # Similar Products Section
-    else:
+    elif rec_type == "Similar Products":
         st.header("🔍 Find Similar Products")
         
         product_id = st.text_input(
@@ -110,10 +175,14 @@ def main():
                         st.warning("No similar products found.")
                 except Exception as e:
                     st.error(f"Error finding similar products: {e}")
+    
+    # Statistics Section
+    else:
+        show_statistics(engine)
 
     # Footer
     st.markdown("---")
-    st.markdown("*Mady By Ziad Boukhalkhal - Khalil Hamdaoui*")
+    st.markdown("*Made By Ziad Boukhalkhal - Khalil Hamdaoui*")
 
 if __name__ == "__main__":
     main()
